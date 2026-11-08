@@ -155,6 +155,9 @@ fi
 
 # ---------- 4. Nginx 80 + 证书 ----------
 mkdir -p /var/www/certbot /etc/nginx/snippets
+# 关键: 顶部 umask 077 会让 webroot 建成 700, nginx www-data 无法读取 -> ACME 403
+# 必须显式放宽 webroot 权限
+chmod 755 /var/www/certbot
 touch /etc/nginx/snippets/sub-proxy.conf; chmod 644 /etc/nginx/snippets/sub-proxy.conf
 cat > /etc/nginx/sites-available/default <<EOF
 server {
@@ -170,8 +173,10 @@ nginx -t && systemctl enable --now nginx && systemctl reload nginx
 
 if [[ ! -f /etc/letsencrypt/live/$DOMAIN/fullchain.pem ]]; then
   info "申请 Let's Encrypt 证书 ..."
-  certbot certonly --webroot -w /var/www/certbot -d "$DOMAIN" \
-    --email root@$DOMAIN --agree-tos -n --non-interactive
+  # certbot 子目录同样受 umask 影响, 申请时临时放宽为 022, 保证 challenge 可读
+  (umask 022; certbot certonly --webroot -w /var/www/certbot -d "$DOMAIN" \
+    --email root@$DOMAIN --agree-tos -n --non-interactive)
+  chmod -R a+rX /var/www/certbot 2>/dev/null || true
 fi
 
 # ---------- 5. Nginx TLS 入口 ----------
