@@ -50,13 +50,16 @@ Internet:443   → Xray REALITY（SNI = 你的域名, target = 127.0.0.1:8443）
 - 80、443 端口可从公网访问
 
 ## 快速使用
-
 ### 方式一：直接从 GitHub 拉取运行
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/jamesszg/self-modified-3xui-panel-install-sh/main/deploy_3xui_nginx_reality.sh -o /root/deploy.sh
 chmod +x /root/deploy.sh
 bash /root/deploy.sh
+```
+或者
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/jamesszg/self-modified-3xui-panel-install-sh/main/deploy_3xui_nginx_reality.sh)
 ```
 
 ### 方式二：本地上传
