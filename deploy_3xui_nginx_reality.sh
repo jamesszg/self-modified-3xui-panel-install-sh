@@ -54,7 +54,10 @@ info "speedtest-go 架构: ${ARCH:-不支持}"
 echo "========== 输入配置 =========="
 ask DOMAIN "域名 (如 example.com)" ""
 while [[ -z "$DOMAIN" ]]; do warn "域名不能为空"; ask DOMAIN "域名 (如 example.com)" ""; done
+# 输入校验: 防止域名/后缀被拼进 nginx/SQL/命令行时注入
+[[ "$DOMAIN" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]] || { err "域名格式不合法: $DOMAIN"; exit 1; }
 PUB_IP=$(curl -fsS --max-time 8 https://api.ipify.org 2>/dev/null || curl -fsS --max-time 8 https://ifconfig.me/ip 2>/dev/null || echo "")
+[[ "$PUB_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || PUB_IP=""
 info "本机公网 IP: ${PUB_IP:-未知}"
 DOMAIN_IP=$(getent hosts "$DOMAIN" | awk '{print $1}' | head -1 || true)
 [[ -z "$DOMAIN_IP" ]] && DOMAIN_IP=$(dig +short "$DOMAIN" A 2>/dev/null | head -1 || true)
@@ -73,6 +76,10 @@ ask_secret PANEL_PASS "面板密码 (回车自动生成, 不回显)"
 [[ -z "$PANEL_PASS" ]] && PANEL_PASS=$(openssl rand -base64 12 | tr -dc 'a-zA-Z0-9' | head -c 16)
 PANEL_BASE="3xui-$(openssl rand -hex 4)"
 ask PANEL_BASE "面板后缀 webBasePath (不带斜杠)" "$PANEL_BASE"
+[[ "$PANEL_BASE" =~ ^[a-zA-Z0-9_-]+$ ]] || { err "面板后缀只能含字母/数字/_/-: $PANEL_BASE"; exit 1; }
+[[ "$PANEL_USER" =~ ^[a-zA-Z0-9_-]+$ ]] || { err "面板用户名只能含字母/数字/_/-: $PANEL_USER"; exit 1; }
+# 面板密码禁止换行(防止写汇总文件时伪造行)
+case "$PANEL_PASS" in *$'\n'*|*$'\r'*) err "面板密码不能含换行"; exit 1;; esac
 ask DO_REALITY "是否创建 REALITY 443 入站? (y/N)" "y"
 ask DO_PANEL_CERT "是否给面板配证书(之后新 TLS 入站可点'从面板配置')? (y/N)" "N"
 ask DO_SPEEDTEST "是否部署 LibreSpeed 测速到 / ? (y/N)" "y"
@@ -98,6 +105,8 @@ BK=$(backup); info "已备份到 $BK"
 # 这里停服务后用 sqlite3 UPSERT settings 表, 改完重启生效
 sql_set(){
   local _key="$1" _val="$2"
+  # SQL 转义: 单引号翻倍, 防止值里带 ' 打破语句
+  _key="${_key//\'/\'\'}"; _val="${_val//\'/\'\'}"
   sqlite3 /etc/x-ui/x-ui.db "DELETE FROM settings WHERE key='$_key'; INSERT INTO settings (key,value) VALUES ('$_key','$_val');"
   echo "  sql_set $_key = $_val"
 }
@@ -161,11 +170,14 @@ chmod 755 /var/www/certbot
 touch /etc/nginx/snippets/sub-proxy.conf; chmod 644 /etc/nginx/snippets/sub-proxy.conf
 cat > /etc/nginx/sites-available/default <<EOF
 server {
-    listen 80;
-    server_name $DOMAIN;
+    listen 80 default_server;
+    listen 8080 default_server;
+    listen 8000 default_server;
+    server_name $DOMAIN _;
     root /var/www/certbot;
     location /.well-known/acme-challenge/ {}
-    location / { return 301 https://\$host\$request_uri; }
+    # 所有尝试性 HTTP 连接(任意 Host/路径)统一回落到 443 测速页
+    location / { return 301 https://$DOMAIN/; }
 }
 EOF
 ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
@@ -175,7 +187,7 @@ if [[ ! -f /etc/letsencrypt/live/$DOMAIN/fullchain.pem ]]; then
   info "申请 Let's Encrypt 证书 ..."
   # certbot 子目录同样受 umask 影响, 申请时临时放宽为 022, 保证 challenge 可读
   (umask 022; certbot certonly --webroot -w /var/www/certbot -d "$DOMAIN" \
-    --email root@$DOMAIN --agree-tos -n --non-interactive)
+    --email "root@$DOMAIN" --agree-tos -n --non-interactive)
   chmod -R a+rX /var/www/certbot 2>/dev/null || true
 fi
 
@@ -207,6 +219,12 @@ if [[ "$DO_SPEEDTEST" == y* ]]; then
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection \"upgrade\";
+        # 未知路径(如错后缀 /abcxui)后端会回 404 明文, 拦截后回落到测速首页
+        proxy_intercept_errors on;
+        error_page 404 = @speedtest_fallback;
+    }
+    location @speedtest_fallback {
+        return 302 https://\$host/;
     }"
 else
   NGINX_ROOT_LOCATION="    location / {
@@ -217,15 +235,18 @@ fi
 
 cat > /etc/nginx/sites-available/default <<EOF
 server {
-    listen 80;
-    server_name $DOMAIN;
+    listen 80 default_server;
+    listen 8080 default_server;
+    listen 8000 default_server;
+    server_name $DOMAIN _;
     root /var/www/certbot;
     location /.well-known/acme-challenge/ {}
-    location / { return 301 https://\$host\$request_uri; }
+    # 所有尝试性 HTTP 连接(任意 Host/路径/常见备用口)统一回落到 443 测速页
+    location / { return 301 https://$DOMAIN/; }
 }
 server {
 $NGINX_TLS_LISTEN
-    server_name $DOMAIN;
+    server_name $DOMAIN _;
     ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
@@ -235,11 +256,19 @@ $NGINX_TLS_LISTEN
     add_header Referrer-Policy "no-referrer" always;
 $NGINX_REALIP
 $NGINX_ROOT_LOCATION
-    location /$PANEL_BASE/ {
+    # 注意: location 不带尾杠, /xui 和 /xui/ 都能匹配进面板, 由面板补尾杠跳转
+    location /$PANEL_BASE {
         proxy_pass http://127.0.0.1:2053;
+        # 关键: 面板返回的跳转 Location 若是绝对地址(127.0.0.1:2053),
+        # Nginx 默认会改写成带本机 server_port(8443)的地址 -> 浏览器连不上
+        # 显式改写回对外 443, 相对跳转则原样透传
+        proxy_redirect http://127.0.0.1:2053/ https://\$host/;
+        proxy_redirect https://127.0.0.1:2053/ https://\$host/;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Forwarded-Host \$host;
+        proxy_set_header X-Forwarded-Port 443;
+        proxy_set_header X-Forwarded-Proto https;
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
@@ -318,7 +347,8 @@ info "API Token 校验 OK. 面板: https://$DOMAIN/$PANEL_BASE/"
   for _k in subPath subJsonPath subClashPath; do
     _p=$(sql_get "$_k" || true)
     if [[ -n "${_p:-}" ]]; then
-      printf '    location %s {\n        proxy_pass http://127.0.0.1:2096;\n        proxy_set_header Host $host;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_http_version 1.1;\n    }\n' "$_p"
+      _loc="${_p%/}"  # 去掉尾杠: 带/不带尾杠的订阅路径都能匹配, 避免掉进测速页
+      printf '    location %s {\n        proxy_pass http://127.0.0.1:2096;\n        proxy_redirect http://127.0.0.1:2096/ https://$host/;\n        proxy_set_header Host $host;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_http_version 1.1;\n    }\n' "$_loc"
     fi
   done
 } > /etc/nginx/snippets/sub-proxy.conf
